@@ -1,0 +1,398 @@
+import json
+import requests
+import feedparser
+from bs4 import BeautifulSoup
+import openai
+from datetime import datetime, timedelta
+import time
+import os
+
+
+
+# VARIABLES
+openai.api_key = os.environ.get('openai_key', 'Default Value') # OPENAI
+linkedin_token = os.environ.get('lin_access_token', 'Default Value') # LINKEDIN token expires every 2 months uses 19nt_dev app (not Harry Post) https://www.linkedin.com/developers/tools/oauth
+
+time_period=24 # Maximum age in hours of articles to include
+
+bucket_name = "19nt-news" # S3 target bucket for json files
+write_to_s3 = True
+
+
+keywords_tech = [
+    'generative ai',
+    'genai',
+    'llm',
+    'chatgpt',
+    'adept',
+    'anthropic',
+    'bard',
+    'hugging face',
+    'Nvidia',
+    'Bedrock',
+    'Amazon Titan',
+    'AI21',
+    'Jurassic-2',
+    'Stable Diffusion'
+]
+
+# industry keywords currently not used
+keywords_industry = [
+    'enterprise',
+    'hack',
+    'security',
+    'cyber',
+    'warfare',
+    'china',
+    'chinese',
+    'supply chain',
+    'climate',
+    'disease',
+    'copyright',
+    'privacy',
+    'regulat',
+    'framework',
+    'SEC',
+    'FCA',
+    'ruling',
+    'court',
+    'sue',
+    'adoption',
+    'finance',
+    'J.P. Morgan',
+    'Morgan Stanley',
+    'Citi',
+    'Goldman',
+    'stock exchange',
+    'LSEG',
+    'NYSE',
+    'Nasdaq',
+    'bank',
+    'insurance',
+    'investment',
+    'funding',
+    'PWC',
+    'KPMG',
+    'BAIN',
+    'McKinsey',
+    'Deloitte',
+    'BCG'
+]
+
+rss_feed_urls = [
+    {"source": "TechCrunch", "url": "https://techcrunch.com/feed/"},
+    {"source": "CNBC", "url": "https://www.cnbc.com/id/100727362/device/rss/rss.html"},
+    {"source": "Wired", "url": "https://www.wired.com/feed/rss"},
+    {"source": "Daily AI", "url": "https://dailyai.com/feed/"},
+    {"source": "VentureBeat", "url": "http://feeds.feedburner.com/venturebeat/SZYF"},
+    {"source": "ZDNet", "url": "https://www.zdnet.com/news/rss.xml"},
+    {"source": "InfoWorld", "url": "https://www.infoworld.com/uk/index.rss"},
+    {"source": "Mashable", "url": "https://mashable.com/feeds/rss/all"},
+    {"source": "Forbes", "url": "https://www.forbes.com/innovation/feed2"},
+    {"source": "BBC Business", "url": "http://feeds.bbci.co.uk/news/business/rss.xml"},
+    {"source": "BBC World", "url": "http://feeds.bbci.co.uk/news/world/rss.xml"},
+    {"source": "Yahoo", "url": "https://finance.yahoo.com/rss/topstories"},
+    {"source": "CoinDesk", "url": "https://www.coindesk.com/arc/outboundfeeds/rss/"},
+    {"source": "CoinTelegraph", "url": "https://cointelegraph.com/rss"}
+]
+
+# REMOVED FEEDS
+#    {"source": "CNET", "url": "https://www.cnet.com/rss/news/"},
+#    {"source": "CNN US", "url": "http://rss.cnn.com/rss/cnn_us.rss"},
+#    {"source": "CNN World", "url": "http://rss.cnn.com/rss/cnn_world.rss"},
+#    {"source": "Dow Jones", "url": "https://feeds.a.dj.com/rss/RSSWSJD.xml"},
+
+
+
+
+
+# FUNCTIONS
+
+print('Loading function')
+
+#POST TO LINKEDIN
+def linkedin_post(post_summary):
+    # Prepare headers for the request
+    headers = {
+        'Authorization': f'Bearer {linkedin_token}',
+        'Content-Type': 'application/json',
+        'X-Restli-Protocol-Version': '2.0.0'
+    }
+
+    # Data payload for the new post
+    post_data = {
+    # HA
+    "author": "urn:li:person:Ps7RkNIAvC",
+
+    # CA
+    #  "author": "urn:li:person:pESfU3PUs1",
+    "lifecycleState": "PUBLISHED",
+    "specificContent": {
+        "com.linkedin.ugc.ShareContent": {
+            "shareCommentary": {
+                "text": post_summary
+            },
+            "shareMediaCategory": "NONE",
+        }
+    },
+    "visibility": {
+        "com.linkedin.ugc.MemberNetworkVisibility": "PUBLIC"
+    }
+}
+
+    # Make the API request
+    response = requests.post(
+        'https://api.linkedin.com/v2/ugcPosts',
+        headers=headers,
+        json=post_data
+    )
+
+    # Check if the request was successful and print the response
+    if response.status_code == 201:
+        print('Successfully posted to LinkedIn!')
+    else:
+        print(f'Failed to post to LinkedIn: {response.content}')
+    return None
+
+def send_email(subject, body, sender, recipients):
+    import boto3
+    ses_client = boto3.client('ses', region_name='us-east-1')  # Replace with your desired AWS region
+
+    try:
+        response = ses_client.send_email(
+            Source=sender,
+            Destination={'ToAddresses': recipients},
+            Message={
+                'Subject': {'Data': subject},
+                'Body': {'Text': {'Data': body}}
+            }
+        )
+        print("Email sent successfully! Message ID: " + response['MessageId'])
+    except Exception as e:
+        print("Error sending email: " + str(e))
+
+def write_json_to_s3(bucket_name, file_name, data):
+    import boto3
+    import json
+    from datetime import datetime
+
+    # Initialize a session using Amazon S3
+    s3 = boto3.client('s3')
+    
+    # Serialize the JSON data
+    json_data = json.dumps(data)
+    
+    # Write the JSON data to S3
+    s3.put_object(Bucket=bucket_name, Key=file_name, Body=json_data, ContentType='application/json')
+
+# Handle different date formats from different news feeds
+def parse_date(published_date_str):
+    # Manual conversion of some known timezones to their UTC offsets.
+    timezone_mappings = {
+        'EDT': '-0400',
+        'EST': '-0500',
+        'CST': '-0600',
+        'PST': '-0800'
+        # Add more mappings as needed
+    }
+    
+    for tz, offset in timezone_mappings.items():
+        published_date_str = published_date_str.replace(tz, offset)
+
+    formats = ["%a, %d %b %Y %H:%M:%S %z","%a, %d %b %Y %H:%M:%S %Z"]
+    
+    for fmt in formats:
+        try:
+            return datetime.strptime(published_date_str, fmt)
+        except ValueError:
+            continue
+
+    return None
+
+# Check if a story is not too old
+def is_old(published_date_str):
+    published_date = parse_date(published_date_str)
+                    
+    if published_date is not None:
+        # Get the current time and date
+        current_date = datetime.now(published_date.tzinfo)
+        # Calculate the time difference
+        time_difference = current_date - published_date
+        # Check if it's more than 24 hours old
+        if time_difference < timedelta(hours=time_period):
+            return False
+        else:
+            return True
+
+# Write an intro for our LinkedIn post. GPT does this based on a list of story titles
+def ai_intro(titles_in):
+    response = openai.ChatCompletion.create(
+#        model="gpt-3.5-turbo",
+        model="gpt-4",
+        messages=[
+            {"role": "system", "content": "You will be provided with a list of one or more news headlines about AI Ethics and Regulation from different online sources. Your task is to write a single short introduction for a daily LinkedIn post which contains these stories. Your output should be no longer than about 100 words in length. Your style should be professional and matter of fact, avoid superlatives and don't use words like 'exciting' or 'excited'. Include relevant hashtags after the summary"},
+            {"role": "user", "content": titles_in}
+        ],
+        temperature=0,
+        max_tokens=200,
+        top_p=1.0,
+        frequency_penalty=0.0,
+        presence_penalty=0.0
+    )
+    return response.choices[0].message['content'].strip()
+
+def scrape_article_text(url):
+    response = requests.get(url)
+    soup = BeautifulSoup(response.content, "html.parser")
+    article_body = soup.find("article")
+    if article_body is None:
+        return None
+    article_text = article_body.get_text(separator="\n")
+    return article_text.strip()
+
+
+def ai_summarize(article_in):
+    scraped_text = scrape_article_text(article_in)
+    if not scraped_text:
+        return ""
+    response = openai.ChatCompletion.create(
+#        model="gpt-3.5-turbo",
+        model="gpt-4",
+        messages=[
+            {"role": "system", "content": "You will be provided with a news article, and your task is to summarize it in the English language."},
+            {"role": "user", "content": scraped_text}
+        ],
+        temperature=0,
+        max_tokens=250,
+        top_p=1.0,
+        frequency_penalty=0.0,
+        presence_penalty=0.0
+    )
+    return response.choices[0].message['content'].strip()
+
+
+def ai_classify_bool(title_in):
+    response = openai.ChatCompletion.create(
+        model="gpt-4",
+#        model="gpt-3.5-turbo",
+        messages=[
+            {"role": "system", "content": "You will be provided with a news headline. Your job is to classify the news headline, determining if it is about AI regulation and ethics (including AI security and AI standards). Return 'True' or 'False'"},
+            {"role": "user", "content": title_in}
+        ],
+        temperature=0,
+        max_tokens=128,
+        top_p=1.0,
+        frequency_penalty=0.0,
+        presence_penalty=0.0
+    )
+    return response.choices[0].message['content'].strip()
+
+
+def str_to_bool(s):
+    return s.lower() == 'true'
+
+
+# Search each RSS feed for relevant stories
+def search_feeds(feed_urls, first_list=None, second_list=None):   
+    counter = 0
+    titles = ""
+    stories = ""
+    titles2 = ""
+    stories2 = ""
+    body = ""
+    body2 = ""
+
+    for feed_url in feed_urls:
+        if counter == 20: # LinkedIn post will fail >3000 characters;
+            break
+        else:
+            feed = feedparser.parse(feed_url['url'])           
+            if feed.status == 200:
+                for entry in feed.entries:
+                    if hasattr(entry, 'title') and hasattr(entry,'published') and hasattr(entry,'link'):
+                        if not is_old(entry.published):
+
+# *** KEYWORD SEARCH ***
+#                       if (any(item.lower() in entry.title.lower() for item in first_list)) or ("AI" in entry.title):
+
+
+# *** <SEMANTIC SEARCH> ***
+                            print("trying: ", entry.title)
+                            maxretry = 5
+                            for retry in range(1,maxretry +1):
+                                try:
+                                    mytheme = ai_classify_bool(entry.title)
+                                    break
+                                except Exception as e:
+                                    if retry == maxretry:
+                                        raise
+                                print("Pause and retry")
+                                time.sleep(10)
+                            mytheme = str_to_bool(mytheme)
+    
+                            if mytheme: # If we have a match
+                                print("Match! Adding story ..")
+# *** </SEMANTIC SEARCH> ***
+
+                                counter += 1
+                                print(counter)
+                                if counter < 11: # LinkedIn post will fail >3000 characters so split into 10 stories at a time;
+                                    titles += str(counter) + ": " + entry.title + "\n"
+                                    stories += str(counter) + ": " + entry.title + "\n" + feed_url['source'] + ": " + entry.link + "\n\n"
+                                elif 11 <= counter <= 20:
+                                    stories2 += str(counter) + ": " + entry.title + "\n" + feed_url['source'] + ": " + entry.link + "\n\n"
+                                else:
+                                    break
+
+# Write to S3
+                                print("Building summary ..")
+                                summary = ai_summarize(entry.link)
+                                if write_to_s3: #Prepare JSON file and write to S3
+                                    data = {"datestamp": datetime.now().isoformat(),"topic": "aireg","title": entry.title,"source": feed_url['source'],"url": entry.link,"summary": summary}
+                                    file_name = "aireg/" + datetime.now().isoformat() + "-aireg.json" # Keep this code here as there will be multiple writes in the for loop
+                                    print("Writing file: ", file_name, "\n")
+                                    write_json_to_s3(bucket_name, file_name, data)
+
+
+
+    if counter > 0:
+        print("Generating intro ..")
+        the_intro = ai_intro(titles)
+        body = the_intro + "\n\n" + stories + "This newsletter is fully automated using OpenAI and LinkedIn APIs\n\n"
+    if counter > 10:
+        the_intro2 = "Today's AI ethics and regulation news, part 2:"
+        body2 = the_intro2 + "\n\n" + stories2 + "This newsletter is fully automated using OpenAI and LinkedIn APIs\n\n"
+            
+    else:
+        print("No matches")
+              
+    print("End")
+    return body, body2, counter
+
+
+def lambda_handler(event, context):
+    storycount = 0
+    post1, post2, storycount = search_feeds(rss_feed_urls, keywords_tech, keywords_industry)
+    print("_" * 20)
+    print("Count: ", storycount)
+    print(post1, "\n\n", post2)
+    if storycount > 0: #If we have found stories .. post them to LinkedIn
+        linkedin_post(post1)
+        if storycount > 10:
+            linkedin_post(post2)
+    else:
+        print("no stories")
+
+
+    subject = 'AI Regulation, '+ str(storycount) + ' result(s)'
+    sender = "harry@19nt.com"
+    recipients = [
+        "chrismicallison@gmail.com"
+        ]
+    body = post1 + "\n\n" + post2
+    send_email(subject, body, sender, recipients)
+
+
+
+    return
+
